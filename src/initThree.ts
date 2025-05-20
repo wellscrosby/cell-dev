@@ -4,7 +4,7 @@ import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import { VolumeRenderShader1 } from 'three/addons/shaders/VolumeShader.js';
 import { GUI } from 'three/addons/libs/lil-gui.module.min.js';
 import { DiffusionSim } from './processVolume';
-
+import { Cell, checkIntersection } from './cells';
 // Global variables
 let stats: Stats;
 let scene: THREE.Scene;
@@ -14,12 +14,14 @@ let controls: OrbitControls;
 let volumeTexture: THREE.Data3DTexture;
 let mesh: THREE.Mesh;
 let dimensions = { x: 128, y: 128, z: 128 };
+let isSimulating = false;
 let isPlaying = false;
 let gui: GUI;
 let diffusionSim: DiffusionSim;
 let simIterationsPerFrame = 10;
 let diffusionConstant = 1.0;
-let spheres: THREE.Mesh[] = [];
+let deltaTime = 1.0 / 60.0;
+let cells: Cell[] = [];
 let axesHelper: THREE.AxesHelper;
 
 function createStats() {
@@ -40,6 +42,15 @@ function createScene() {
         new THREE.Color(0x0000ff).multiplyScalar(2)  // Blue z-axis
     );
     axesHelper.position.set(-dimensions.x / 20, -dimensions.y / 20, - dimensions.z / 20);
+
+    // // add point light
+    // const pointLight = new THREE.PointLight(0xffffff, 1, 1000, 2);
+    // pointLight.position.set(dimensions.x / 2, dimensions.y / 2, dimensions.z / 2);
+    // // add sphere where the light is
+    // const sphere = new THREE.Mesh(new THREE.SphereGeometry(1, 32, 32), new THREE.MeshBasicMaterial({ color: 0xffffff }));
+    // pointLight.add(sphere);
+    // scene.add(pointLight);
+
 
     scene.add(axesHelper);
     return scene;
@@ -74,14 +85,21 @@ function createCamera() {
 }
 
 function updateCamera() {
-    const maxDimension = Math.max(dimensions.x, dimensions.y, dimensions.z) * (3 ** 0.5);
-    const h = maxDimension * 1.2;
+    const maxDimension = Math.max(dimensions.x, dimensions.y, dimensions.z);
+    const diagonal = Math.sqrt(dimensions.x ** 2 + dimensions.y ** 2 + dimensions.z ** 2);
+
+    const h = diagonal * 1.2;
     const aspect = window.innerWidth / window.innerHeight;
     camera.left = -h * aspect / 2;
     camera.right = h * aspect / 2;
     camera.top = h / 2;
     camera.bottom = -h / 2;
     camera.position.set(-maxDimension / 3, -maxDimension * 2, dimensions.z);
+    const cameraDistance = Math.sqrt(camera.position.x ** 2 + camera.position.y ** 2 + camera.position.z ** 2);
+    //change the depth of the camera
+    camera.near = 0.1;
+    camera.far = cameraDistance + diagonal;
+    camera.zoom = 1;
     camera.updateProjectionMatrix();
 }
 
@@ -96,31 +114,31 @@ async function resetSimulation() {
     scene.remove(mesh);
     mesh = createVolumeMesh();
     controls.target.set(dimensions.x / 2, dimensions.y / 2, dimensions.z / 2);
-    isPlaying = false;
+    isSimulating = false;
     gui.controllers?.find((c) => c.property === "playPause")?.name(
-        isPlaying ? "⏸ Pause" : "▶ Play"
+        isSimulating ? "⏸ Pause" : "▶ Play"
     );
 
     updateCamera();
     updateAxesHelper();
 
-    spheres.forEach(sphere => scene.remove(sphere));
-    spheres = [];
+    cells.forEach(cell => scene.remove(cell.mesh));
+    cells = [];
 
     diffusionSim.cleanup();
-    diffusionSim = await DiffusionSim.create(dimensions, volumeTexture.image.data as Float32Array, diffusionConstant);
+    diffusionSim = await DiffusionSim.create(dimensions, volumeTexture.image.data as Float32Array, diffusionConstant, deltaTime, cells);
 }
 
 function createGUI() {
     gui = new GUI();
 
-    gui.add(dimensions, 'x', 8, 256, 16).onChange(() => {
+    gui.add(dimensions, 'x', 8, 512, 16).onChange(() => {
         resetSimulation();
     });
-    gui.add(dimensions, 'y', 8, 256, 16).onChange(() => {
+    gui.add(dimensions, 'y', 8, 512, 16).onChange(() => {
         resetSimulation();
     });
-    gui.add(dimensions, 'z', 8, 256, 16).onChange(() => {
+    gui.add(dimensions, 'z', 8, 512, 16).onChange(() => {
         resetSimulation();
     });
 
@@ -142,8 +160,20 @@ function createGUI() {
         0.01
     ).onChange((value: number) => {
         diffusionConstant = value;
-        diffusionSim.setDiffusionConstant(diffusionConstant);
+        diffusionSim.setCombinedConstant(diffusionConstant, deltaTime);
     }).name('Diffusion Constant');
+
+    gui.add(
+        { deltaTime },
+        'deltaTime',
+        0.0,
+        1.0,
+        0.01
+    ).onChange((value: number) => {
+        deltaTime = value;
+        diffusionSim.setCombinedConstant(diffusionConstant, deltaTime);
+        diffusionSim.setDeltaTime(deltaTime);
+    }).name('Delta Time');
 
     gui.add(
         { renderstyle: 0 },
@@ -156,17 +186,17 @@ function createGUI() {
 
 
     gui.add({
-        addSpheres: () => {
-            addSpheresToScene(10, 5); // Default values: 10 spheres with radius 5
+        addCells: () => {
+            addCellsToScene(10); // Default values: 10 cells with radius 5
         }
-    }, 'addSpheres').name('Add Spheres');
+    }, 'addCells').name('Add Cells');
 
     gui.add({ reset: () => resetSimulation() }, 'reset')
         .name('Reset');
 
     gui.add({
         stepFrame: () => {
-            if (!isPlaying) {
+            if (!isSimulating) {
                 stepSimulation();
             }
         }
@@ -175,9 +205,9 @@ function createGUI() {
     gui.add(
         {
             playPause: () => {
-                isPlaying = !isPlaying;
+                isSimulating = !isSimulating;
                 gui.controllers?.find((c) => c.property === "playPause")?.name(
-                    isPlaying ? "⏸ Pause" : "▶ Play"
+                    isSimulating ? "⏸ Pause" : "▶ Play"
                 );
             },
         },
@@ -185,16 +215,10 @@ function createGUI() {
     ).name("▶ Play");
 }
 
-function generateVolumeData(pointSource: boolean = false) {
+function generateVolumeData(randomStart: boolean = false) {
     const data = new Float32Array(dimensions.x * dimensions.y * dimensions.z);
 
-    if (pointSource) {
-        const centerX = Math.floor(dimensions.x / 2);
-        const centerY = Math.floor(dimensions.y / 2);
-        const centerZ = Math.floor(dimensions.z / 2);
-        const centerIndex = centerX + centerY * dimensions.x + centerZ * dimensions.x * dimensions.y;
-        data[centerIndex] = 1.0;
-    } else {
+    if (randomStart) {
         for (let i = 0; i < data.length; i++) {
             const x = i % dimensions.x;
             const y = Math.floor((i / dimensions.x) % dimensions.y);
@@ -214,12 +238,13 @@ function generateVolumeData(pointSource: boolean = false) {
             data[i] = val;
         }
     }
+
     return data;
 }
 
 function createVolumeMesh() {
     // Create the 3D texture
-    const data = generateVolumeData(true);
+    const data = generateVolumeData();
     volumeTexture = new THREE.Data3DTexture(
         data,
         dimensions.x,
@@ -241,7 +266,7 @@ function createVolumeMesh() {
     uniforms['u_size'].value.set(dimensions.x, dimensions.y, dimensions.z);
     uniforms['u_clim'].value.set(0, 10);
     uniforms['u_renderstyle'].value = 0;
-    uniforms['u_renderthreshold'].value = 0.5;
+    uniforms['u_renderthreshold'].value = 0.15;
     uniforms['u_cmdata'].value = colormapTexture;
 
     const material = new THREE.ShaderMaterial({
@@ -252,9 +277,11 @@ function createVolumeMesh() {
         transparent: true
     });
 
+    // console.log(VolumeRenderShader1.fragmentShader);
+
     // Create the volume mesh
     const geometry = new THREE.BoxGeometry(dimensions.x, dimensions.y, dimensions.z);
-    geometry.translate(dimensions.x / 2 - 0.5, dimensions.y / 2 - 0.5, dimensions.z / 2 - 0.5);
+    geometry.translate(dimensions.x / 2, dimensions.y / 2, dimensions.z / 2);
     const mesh = new THREE.Mesh(geometry, material);
 
     // add an outline of the volume
@@ -275,39 +302,12 @@ function createVolumeMesh() {
 function updateVolumeMesh(newData: Float32Array) {
     volumeTexture.image.data = newData;
     volumeTexture.needsUpdate = true;
-
+    // (mesh.material as THREE.ShaderMaterial).uniforms['u_clim'].value.set(Math.min(...newData), Math.max(...newData));
     (mesh.material as THREE.ShaderMaterial).uniforms['u_size'].value.set(dimensions.x, dimensions.y, dimensions.z);
     (mesh.material as THREE.ShaderMaterial).needsUpdate = true;
 }
 
-function addSpheresToScene(num_cells: number, radius: number) {
-    // // Clear existing spheres if any
-    // spheres.forEach(sphere => scene.remove(sphere));
-    // spheres = [];
-
-    // Create sphere geometry and material (shared between all spheres)
-    const geometry = new THREE.SphereGeometry(radius, 32, 32);
-    const material = new THREE.MeshBasicMaterial({
-        color: 0x0000f0,
-        transparent: true,
-        opacity: 0.7
-    });
-
-    // Helper function to check if a position intersects with existing spheres
-    function checkIntersection(x: number, y: number, z: number): boolean {
-        for (const sphere of spheres) {
-            const dx = sphere.position.x - x;
-            const dy = sphere.position.y - y;
-            const dz = sphere.position.z - z;
-            const distance = Math.sqrt(dx * dx + dy * dy + dz * dz);
-            if (distance < radius * 2) { // 2 * radius is minimum distance between sphere centers
-                return true;
-            }
-        }
-        return false;
-    }
-
-    // Add spheres with collision detection
+function addCellsToScene(num_cells: number) {
     let attempts = 0;
     const maxAttempts = 1000; // Prevent infinite loops
 
@@ -317,20 +317,23 @@ function addSpheresToScene(num_cells: number, radius: number) {
 
         // Keep trying new positions until we find one without intersection
         do {
-            x = radius + Math.random() * (dimensions.x - 2 * radius);
-            y = radius + Math.random() * (dimensions.y - 2 * radius);
-            z = radius + Math.random() * (dimensions.z - 2 * radius);
-            intersects = checkIntersection(x, y, z);
+            x = Math.floor(Math.random() * dimensions.x);
+            y = Math.floor(Math.random() * dimensions.y);
+            z = Math.floor(Math.random() * dimensions.z);
+            intersects = checkIntersection(cells, { x, y, z });
             attempts++;
         } while (intersects && attempts < maxAttempts);
 
         // Only add sphere if we found a valid position
         if (!intersects) {
-            const sphere = new THREE.Mesh(geometry, material);
-            sphere.position.set(x, y, z);
-            scene.add(sphere);
-            spheres.push(sphere);
+            const cell = new Cell({ x, y, z }, ((Math.random() / 0.5) + 0.5) * 1000.0);
+            scene.add(cell.mesh);
+            cells.push(cell);
         }
+    }
+
+    if (diffusionSim) {
+        diffusionSim.updateCells(cells);
     }
 }
 
@@ -339,16 +342,33 @@ function setupResizeHandler() {
         updateCamera();
         renderer.setSize(window.innerWidth, window.innerHeight);
     });
+
+    window.addEventListener('blur', () => {
+        console.log("window is deactivated");
+        isPlaying = false;
+    });
+
+    window.addEventListener('focus', () => {
+        console.log("window is activated");
+        isPlaying = true;
+    });
+
+    window.addEventListener('click', (event) => {
+        // console.log("window is activated");
+        isPlaying = true;
+    });
 }
 
 async function animate() {
-    stats.begin();
-    controls.update();
-    renderer.render(scene, camera);
     if (isPlaying) {
-        stepSimulation();
+        stats.begin();
+        controls.update();
+        renderer.render(scene, camera);
+        if (isSimulating) {
+            stepSimulation();
+        }
+        stats.end();
     }
-    stats.end();
 }
 
 async function stepSimulation() {
@@ -369,7 +389,8 @@ export async function initThree() {
     camera = createCamera();
     controls = createControls();
     mesh = createVolumeMesh();
-    diffusionSim = await DiffusionSim.create(dimensions, volumeTexture.image.data as Float32Array, diffusionConstant);
+    // addCellsToScene(10, 5);
+    diffusionSim = await DiffusionSim.create(dimensions, volumeTexture.image.data as Float32Array, diffusionConstant, deltaTime, cells);
     createGUI();
 
     console.log(renderer.getContext());
