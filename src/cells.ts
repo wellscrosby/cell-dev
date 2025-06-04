@@ -5,7 +5,7 @@ export class Cell {
 
     constructor(public position: { x: number, y: number, z: number }, public productionRate: number) {
         this.position = position;
-        const radius = 1; // Fixed radius instead of parameter
+        const radius = 0.5; // Fixed radius instead of parameter
 
         const geometry = new THREE.SphereGeometry(radius, 32, 32);
         const material = new THREE.MeshBasicMaterial({
